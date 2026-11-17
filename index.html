@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Visionneur d’images aléatoires</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #6b7280;
+    --border: #d1d5db;
+    --btn-bg: #f0f0f0;
+    --btn-bg-hover: #e2e2e2;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #1a1a1a;
+      --fg: #f0f0f0;
+      --muted: #9ca3af;
+      --border: #444;
+      --btn-bg: #2a2a2a;
+      --btn-bg-hover: #3a3a3a;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    background: var(--bg);
+    color: var(--fg);
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  body {
+    font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    text-align: center;
+    padding: 2rem 1rem 3rem;
+    margin: 0;
+  }
+  h1 { font-size: 1.6rem; margin-bottom: 1.5rem; }
+  input[type="file"] { display: none; }
+  .row { display: flex; justify-content: center; align-items: center; gap: 0.75rem; flex-wrap: wrap; margin-bottom: 1rem; }
+  button, .file-btn {
+    background: var(--btn-bg);
+    border: 1px solid var(--border);
+    color: var(--fg);
+    padding: 0.6rem 1.1rem;
+    border-radius: 6px;
+    font-size: 1rem;
+    cursor: pointer;
+  }
+  button:hover, .file-btn:hover { background: var(--btn-bg-hover); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .count { color: var(--muted); font-size: 0.95rem; }
+  .progress { color: var(--muted); margin: 1rem 0 0.5rem; }
+  img {
+    max-width: min(90vw, 500px);
+    max-height: 60vh;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    margin-top: 1rem;
+    display: none;
+  }
+  .answer-zone { margin-top: 1.5rem; min-height: 3rem; }
+  .filename {
+    font-size: 1.2rem;
+    font-weight: bold;
+    display: none;
+  }
+  .hint { color: var(--muted); font-size: 0.9rem; margin-top: 0.3rem; }
+  .status { color: var(--muted); font-size: 0.85rem; margin-top: 1.5rem; }
+  .clear-link { color: var(--muted); font-size: 0.85rem; text-decoration: underline; cursor: pointer; background: none; border: none; padding: 0; }
+</style>
+</head>
+<body>
+
+<h1>Visionneur d’images aléatoires</h1>
+
+<div class="row">
+  <button id="folderBtn">Choisir le dossier d’images</button>
+  <button id="reconnectBtn" style="display:none;">Réactiver l’accès au dossier</button>
+  <label class="file-btn" for="fileInput">ou choisir des fichiers</label>
+  <input type="file" id="fileInput" multiple accept="image/*">
+  <span class="count" id="fileCount">0 fichier</span>
+</div>
+
+<div class="row">
+  <button id="nextBtn" disabled>Image suivante</button>
+</div>
+
+<div class="progress" id="progress"></div>
+
+<img id="imgDisplay" alt="">
+
+<div class="answer-zone">
+  <button id="revealBtn" style="display:none;">Afficher la réponse</button>
+  <div class="filename" id="filenameDisplay"></div>
+  <div class="hint" id="hint"></div>
+</div>
+
+<div class="status" id="status"></div>
+<div class="row" style="margin-top:0.5rem;">
+  <button class="clear-link" id="clearBtn" style="display:none;">Effacer les images enregistrées</button>
+</div>
+
+<script>
+  const fileInput = document.getElementById('fileInput');
+  const fileCount = document.getElementById('fileCount');
+  const folderBtn = document.getElementById('folderBtn');
+  const reconnectBtn = document.getElementById('reconnectBtn');
+  const nextBtn = document.getElementById('nextBtn');
+  const revealBtn = document.getElementById('revealBtn');
+  const progress = document.getElementById('progress');
+  const imgDisplay = document.getElementById('imgDisplay');
+  const filenameDisplay = document.getElementById('filenameDisplay');
+  const hint = document.getElementById('hint');
+  const statusEl = document.getElementById('status');
+  const clearBtn = document.getElementById('clearBtn');
+
+  let files = [];      // { name, blob } ou { name, handle }
+  let order = [];
+  let pos = -1;
+  let currentUrl = null;
+
+  const DB_NAME = 'visionneurDB';
+  const STORE = 'images';   // images enregistrées (mode "fichiers")
+  const META = 'meta';      // dossier mémorisé (mode "dossier")
+  let db = null;
+
+  if (!window.showDirectoryPicker) folderBtn.style.display = 'none';
+
+  function openDB() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(DB_NAME, 2);
+      req.onupgradeneeded = () => {
+        const d = req.result;
+        if (!d.objectStoreNames.contains(STORE)) d.createObjectStore(STORE, { keyPath: 'id', autoIncrement: true });
+        if (!d.objectStoreNames.contains(META)) d.createObjectStore(META);
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  function run(storeName, mode, fn) {
+    return new Promise((resolve, reject) => {
+      const t = db.transaction(storeName, mode);
+      const req = fn(t.objectStore(storeName));
+      t.oncomplete = () => resolve(req && req.result);
+      t.onerror = () => reject(t.error);
+    });
+  }
+
+  function saveImagesToDB(list) {
+    return run(STORE, 'readwrite', s => {
+      s.clear();
+      // CORRECTION : on stocke le vrai fichier (f.blob), pas l’objet {name, blob}
+      list.forEach(f => s.add({ name: f.name, blob: f.blob }));
+    });
+  }
+  const loadImagesFromDB = () => run(STORE, 'readonly', s => s.getAll()).then(r => r || []);
+  const clearImagesInDB = () => run(STORE, 'readwrite', s => { s.clear(); });
+  const saveDir = h => run(META, 'readwrite', s => s.put(h, 'dir'));
+  const loadDir = () => run(META, 'readonly', s => s.get('dir'));
+  const clearDir = () => run(META, 'readwrite', s => { s.delete('dir'); });
+
+  function shuffle(arr) {
+    const a = arr.slice();
+    for (let i = a.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+  }
+
+  function setupFiles(fileList) {
+    files = fileList;
+    fileCount.textContent = files.length + (files.length > 1 ? ' fichiers' : ' fichier');
+    order = shuffle(files.map((_, i) => i));
+    pos = -1;
+    nextBtn.disabled = files.length === 0;
+    imgDisplay.style.display = 'none';
+    filenameDisplay.style.display = 'none';
+    revealBtn.style.display = 'none';
+    progress.textContent = '';
+    hint.textContent = '';
+    clearBtn.style.display = files.length > 0 ? 'inline-block' : 'none';
+  }
+
+  // Parcourt un dossier (et ses sous-dossiers) et liste les images
+  async function collect(dir) {
+    const out = [];
+    for await (const [name, h] of dir.entries()) {
+      if (h.kind === 'file') {
+        if (/\.(jpe?g|png|gif|webp|bmp|avif)$/i.test(name)) out.push({ name, handle: h });
+      } else if (h.kind === 'directory') {
+        out.push(...await collect(h));
+      }
+    }
+    return out;
+  }
+
+  async function useDir(dir) {
+    statusEl.textContent = 'Lecture du dossier...';
+    reconnectBtn.style.display = 'none';
+    const list = await collect(dir);
+    setupFiles(list);
+    statusEl.textContent = list.length
+      ? list.length + ' image(s) rechargée(s) automatiquement depuis le dossier.'
+      : 'Aucune image trouvée dans ce dossier.';
+  }
+
+  // Choix du dossier (une seule fois)
+  folderBtn.addEventListener('click', async () => {
+    try {
+      const dir = await showDirectoryPicker({ mode: 'read' });
+      await saveDir(dir);
+      await clearImagesInDB();
+      await useDir(dir);
+    } catch (e) {
+      if (e.name !== 'AbortError') statusEl.textContent = 'Impossible d’ouvrir le dossier : ' + e.message;
+    }
+  });
+
+  // Réautorisation après redémarrage du navigateur (nécessite un clic)
+  reconnectBtn.addEventListener('click', async () => {
+    try {
+      const dir = await loadDir();
+      if (dir && await dir.requestPermission({ mode: 'read' }) === 'granted') await useDir(dir);
+    } catch (e) {
+      statusEl.textContent = 'Accès refusé : ' + e.message;
+    }
+  });
+
+  // Mode "fichiers" (secours)
+  // Réduit chaque image (1600 px max, JPEG) pour économiser la place sur l’iPhone
+  async function shrink(f) {
+    try {
+      const bmp = await createImageBitmap(f);
+      const k = Math.min(1, 1600 / Math.max(bmp.width, bmp.height));
+      const c = document.createElement('canvas');
+      c.width = Math.round(bmp.width * k);
+      c.height = Math.round(bmp.height * k);
+      c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+      if (bmp.close) bmp.close();
+      const b = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.85));
+      return b || f;
+    } catch (e) { return f; }
+  }
+
+  fileInput.addEventListener('change', async () => {
+    const src = Array.from(fileInput.files);
+    const list = [];
+    for (let i = 0; i < src.length; i++) {
+      statusEl.textContent = 'Préparation des images ' + (i + 1) + ' / ' + src.length + '...';
+      list.push({ name: src[i].name, blob: await shrink(src[i]) });
+    }
+    setupFiles(list);
+    statusEl.textContent = 'Enregistrement des images dans le navigateur...';
+    try {
+      await clearDir();
+      await saveImagesToDB(list);
+      statusEl.textContent = 'Images enregistrées : elles seront rechargées automatiquement la prochaine fois.';
+    } catch (e) {
+      statusEl.textContent = "Impossible d’enregistrer les images (elles fonctionnent quand même pour cette session).";
+    }
+  });
+
+  clearBtn.addEventListener('click', async () => {
+    try { await clearImagesInDB(); await clearDir(); } catch (e) {}
+    reconnectBtn.style.display = 'none';
+    setupFiles([]);
+    statusEl.textContent = 'Images enregistrées effacées.';
+  });
+
+  async function showNext() {
+    if (order.length === 0) return;
+    let blob = null, file = null, tries = 0;
+
+    while (!blob && tries < order.length) {
+      pos++;
+      if (pos >= order.length) {
+        order = shuffle(files.map((_, i) => i));
+        pos = 0;
+      }
+      file = files[order[pos]];
+      tries++;
+      try {
+        blob = file.blob || await file.handle.getFile();
+      } catch (e) {
+        console.warn('Fichier illisible, ignoré :', file.name, e);
+      }
+    }
+    if (!blob) {
+      statusEl.textContent = 'Aucune image lisible (vérifie que le dossier est bien synchronisé sur cet appareil).';
+      return;
+    }
+
+    if (currentUrl) URL.revokeObjectURL(currentUrl);
+    currentUrl = URL.createObjectURL(blob);
+
+    imgDisplay.src = currentUrl;
+    imgDisplay.style.display = 'inline-block';
+
+    filenameDisplay.textContent = 'Fichier : ' + file.name;
+    filenameDisplay.style.display = 'none';
+    revealBtn.style.display = 'inline-block';
+    revealBtn.disabled = false;
+
+    progress.textContent = (pos + 1) + ' / ' + order.length;
+    hint.textContent = '';
+  }
+
+  nextBtn.addEventListener('click', showNext);
+
+  revealBtn.addEventListener('click', () => {
+    filenameDisplay.style.display = 'block';
+    revealBtn.disabled = true;
+  });
+
+  (async function init() {
+    try {
+      db = await openDB();
+      try { if (navigator.storage && navigator.storage.persist) await navigator.storage.persist(); } catch (e) {}
+
+      // 1) Dossier mémorisé ?
+      const dir = await loadDir();
+      if (dir) {
+        if (await dir.queryPermission({ mode: 'read' }) === 'granted') {
+          await useDir(dir);
+        } else {
+          statusEl.textContent = 'Dossier mémorisé : clique sur « Réactiver l’accès au dossier ».';
+          reconnectBtn.style.display = '';
+          clearBtn.style.display = 'inline-block';
+        }
+        return;
+      }
+
+      // 2) Sinon, images enregistrées (mode fichiers)
+      const stored = await loadImagesFromDB();
+      const valid = stored.filter(r => r.blob instanceof Blob);
+      if (valid.length > 0) {
+        setupFiles(valid.map(r => ({ name: r.name, blob: r.blob })));
+        statusEl.textContent = valid.length + ' image(s) rechargée(s) automatiquement.';
+      } else if (stored.length > 0) {
+        // anciennes données invalides (bug précédent) : on nettoie
+        await clearImagesInDB();
+        statusEl.textContent = 'Anciennes données invalides supprimées : choisis ton dossier d’images.';
+      }
+    } catch (e) {
+      statusEl.textContent = '';
+    }
+  })();
+</script>
+
+</body>
+</html>
